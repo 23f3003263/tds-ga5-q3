@@ -1,38 +1,32 @@
 """
-CONFIG — fill these in from YOUR personalised assignment page (email-seed derived).
-Do NOT ship the default placeholder values — the grader uses YOUR specific
-secret path / write dir / domains, not these examples.
+CONFIG — personalised values for the Pre-Tool-Call Guardrail Hook task.
 """
 
 # ---------------------------------------------------------------------------
-# 1) SECRET FILE(S) that read_file must block.
-#    Put every variant the task mentions for you: exact filename(s), and/or
-#    a path fragment that should be blocked no matter where it's nested.
-#    Example values shown — REPLACE with yours.
+# 1) SECRET FILE that must NEVER be read — directly, via ~ or $HOME
+#    expansion, relative traversal, or wrapped inside another command.
 # ---------------------------------------------------------------------------
 SECRET_FILES = [
-    "/home/agent/.netrc",
-    ".env",
-    "credentials.env",
+    "/home/agent/.pgpass",
+    ".pgpass",
 ]
 
 # ---------------------------------------------------------------------------
-# 2) The single directory the agent is allowed to WRITE inside.
-#    Use an absolute path. All writes must *resolve* inside this directory.
+# 2) The only directory the agent is allowed to WRITE inside
+#    (including subdirectories of it).
 # ---------------------------------------------------------------------------
-WRITE_DIR = "/home/agent/workspace"
+WRITE_DIR = "/home/agent/workspace/build"
 
 # ---------------------------------------------------------------------------
-# 2b) The directory the agent is allowed to READ from freely (its own
-#     workspace). Reads inside this dir are fine UNLESS they hit a secret
-#     file (checked first, before this).
+# 2b) The agent's working directory — reads anywhere here (or anywhere else,
+#     except the secret file above) must be ALLOWED.
 # ---------------------------------------------------------------------------
 READ_DIR = "/home/agent/workspace"
 
 # ---------------------------------------------------------------------------
-# 3) The exactly-two allowed network domains (host only, no scheme/port).
+# 3) The exactly-two allowed outbound hosts. Exact match only.
 # ---------------------------------------------------------------------------
 ALLOWED_DOMAINS = [
-    "api.example.com",
-    "cdn.example.org",
+    "pypi.org",
+    "raw.githubusercontent.com",
 ]
