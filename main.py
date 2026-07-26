@@ -1,5 +1,4 @@
 import os
-import re
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request
@@ -10,22 +9,7 @@ import config
 app = FastAPI()
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def normalize_path(path: str) -> str:
-    """Collapse .. and . segments without touching the real filesystem."""
-    return os.path.normpath(path)
-
-
 def resolves_inside(path: str, root: str) -> bool:
-    """
-    True iff `path` (absolute or relative) resolves to a location that is
-    the root itself or nested under it, AFTER collapsing '..' / '.'.
-    Relative paths are resolved against `root` (i.e. treated as if the
-    agent's cwd were the root/workspace).
-    """
     root = os.path.normpath(root)
     if os.path.isabs(path):
         full = os.path.normpath(path)
@@ -34,93 +18,93 @@ def resolves_inside(path: str, root: str) -> bool:
     return full == root or full.startswith(root + os.sep)
 
 
-def hits_secret_file(path: str, secrets: list) -> bool:
-    """
-    Block if the normalized path *is* one of the secret files, or ends with
-    one of them (covers '.env' style fragments regardless of directory),
-    or if a secret filename appears as a path component anywhere along the
-    (already-collapsed) path — this catches attempts that climb around
-    with '..' and land back on a sensitive file.
-    """
-    norm = normalize_path(path)
-    norm_abs = norm if os.path.isabs(norm) else os.path.normpath(
-        os.path.join(config.READ_DIR, norm)
-    )
+def expand_path(path: str) -> str:
+    # Handle ~ and $HOME / ${HOME} expansion explicitly (don't trust os.path.expanduser
+    # alone since env vars may differ), then normalize.
+    p = path.replace("${HOME}", "/home/agent").replace("$HOME", "/home/agent")
+    p = os.path.expanduser(p)
+    if not os.path.isabs(p):
+        p = os.path.normpath(os.path.join(config.READ_DIR, p))
+    else:
+        p = os.path.normpath(p)
+    return p
 
+
+def hits_secret_file(path: str, secrets: list) -> bool:
+    resolved = expand_path(path)
     for secret in secrets:
-        secret_norm = os.path.normpath(secret)
-        # exact match on the resolved absolute path
-        if norm_abs == secret_norm:
+        secret_norm = os.path.normpath(os.path.expanduser(secret))
+        if not os.path.isabs(secret_norm):
+            secret_norm = os.path.normpath(os.path.join("/home/agent", secret_norm))
+        if resolved == secret_norm:
             return True
-        # match on basename (covers ".env" nested anywhere, "credentials.env" etc.)
-        if os.path.basename(norm_abs) == os.path.basename(secret_norm):
-            return True
-        # match if the secret's own path is a suffix of the resolved path
-        if norm_abs.endswith(secret_norm):
-            return True
-        # bare fragment (e.g. secret given as just "credentials.env" or ".env")
-        if not os.path.isabs(secret) and secret in norm_abs.split(os.sep):
+        if os.path.basename(resolved) == os.path.basename(secret_norm):
             return True
     return False
 
 
 def extract_host(url: str) -> str:
-    """Pull just the hostname (no scheme, no port, no path) from a URL."""
     if "://" not in url:
-        url = "http://" + url  # let urlparse treat bare host:port/path correctly
+        url = "http://" + url
     parsed = urlparse(url)
     host = parsed.hostname or ""
     return host.lower()
 
 
-# ---------------------------------------------------------------------------
-# Core decision logic
-# ---------------------------------------------------------------------------
+def contains_secret_read(text: str) -> bool:
+    """Scan bash command text for any reference to the secret file, including
+    obfuscated forms (~, $HOME, relative traversal, base64-wrapped)."""
+    lowered = text.lower()
+    for secret in config.SECRET_FILES:
+        name = os.path.basename(secret).lower()
+        if name in lowered:
+            return True
+    # crude base64 hint: if a base64 blob decodes to something containing the secret name
+    import base64
+    import re
+    for token in re.findall(r'[A-Za-z0-9+/=]{8,}', text):
+        try:
+            decoded = base64.b64decode(token, validate=True).decode(errors="ignore").lower()
+            for secret in config.SECRET_FILES:
+                if os.path.basename(secret).lower() in decoded:
+                    return True
+        except Exception:
+            pass
+    return False
 
-def decide(tool: str, arguments: dict) -> str:
-    tool = (tool or "").lower()
 
-    if tool == "read_file":
-        path = arguments.get("path", "")
-        if hits_secret_file(path, config.SECRET_FILES):
-            return "block"
-        return "allow"
+def decide(body: dict):
+    tool = body.get("tool", "")
+
+    if tool == "bash":
+        command = body.get("command", "")
+        if contains_secret_read(command):
+            return "block", "Reading the restricted secret file is never permitted by this agent's policy."
+        return "allow", "Command does not touch the restricted secret file."
 
     if tool == "write_file":
-        path = arguments.get("path", "")
+        path = body.get("path", "")
         if resolves_inside(path, config.WRITE_DIR):
-            return "allow"
-        return "block"
+            return "allow", "Write resolves inside the allowed build directory."
+        return "block", "Write path resolves outside the allowed build directory."
 
-    if tool in ("network", "fetch", "http", "http_request"):
-        url = arguments.get("url", "")
+    if tool == "http_request":
+        url = body.get("url", "")
         host = extract_host(url)
         if host in [d.lower() for d in config.ALLOWED_DOMAINS]:
-            return "allow"
-        return "block"
+            return "allow", "Host is on the allowed domain list."
+        return "block", "Host is not on the allowed domain list."
 
-    # Unknown tool families: default-allow (adjust if spec says otherwise)
-    return "allow"
+    return "allow", "Unrecognized tool type; default allow."
 
 
-# ---------------------------------------------------------------------------
-# Endpoint
-# ---------------------------------------------------------------------------
-
-@app.post("/check")
-async def check(request: Request):
+@app.post("/ga5/{email}/guardrail")
+async def check(email: str, request: Request):
     body = await request.json()
-
-    # Accept a couple of common field-name variants so this survives minor
-    # spec differences; adjust to match the EXACT spec once you've read it.
-    tool = body.get("tool") or body.get("tool_name") or body.get("name")
-    arguments = body.get("arguments") or body.get("input") or body.get("args") or {}
-
-    decision = decide(tool, arguments)
-
-    return JSONResponse({"decision": decision})
+    decision, reason = decide(body)
+    return JSONResponse({"decision": decision, "reason": reason})
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "guardrail-hook"}
+    return {"status": "ok"}
